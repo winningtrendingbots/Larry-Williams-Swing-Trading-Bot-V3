@@ -1,0 +1,79 @@
+name: Kraken Trading Bot V3
+
+on:
+  # Ejecutar cada hora
+  schedule:
+    - cron: '0 * * * *'
+  
+  # Manual
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Simulación (true) o Real (false)'
+        required: false
+        default: 'true'
+
+jobs:
+  trade:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+    
+    - name: 📦 Instalar dependencias
+      run: |
+        pip install --upgrade pip
+        pip install -r requirements.txt
+    
+    - name: 🚀 Ejecutar bot V3 (Multi-Asset + ML + Adaptive)
+      env:
+        # Kraken (configurar en Settings > Secrets)
+        KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
+        KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
+        
+        # Telegram (configurar en Settings > Secrets)
+        TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        
+        # Multi-Asset (editar según preferencias)
+        # Trading pairs se definen en el código
+        MAX_CORRELATION: '0.7'     # Máxima correlación permitida
+        MAX_POSITIONS: '3'         # Máximo posiciones simultáneas
+        
+        # Trading Base
+        LEVERAGE: '3'              # 3x leverage
+        MIN_BALANCE: '30.0'        # Balance mínimo (aumentado para multi-asset)
+        
+        # Risk Management (base - se adaptan según régimen)
+        STOP_LOSS_PCT: '4.0'
+        TAKE_PROFIT_PCT: '8.0'
+        TRAILING_STOP_PCT: '2.5'
+        MIN_PROFIT_FOR_TRAILING: '3.0'
+        
+        # Strategy
+        LOOKBACK_PERIOD: '180d'    # 6 meses de historia para mejor análisis
+        CANDLE_INTERVAL: '1h'      # Velas de 1 hora
+        USE_VOLUME_FILTER: 'true'
+        REGIME_LOOKBACK: '30'      # Ventana para detectar régimen
+        
+        # Machine Learning
+        USE_ML_VALIDATION: 'true'          # Validación ML de swing points
+        ML_CONFIDENCE_THRESHOLD: '0.6'    # Confianza mínima (0.0-1.0)
+        
+        # Mode
+        DRY_RUN: ${{ github.event.inputs.dry_run || 'true' }}
+      
+      run: python kraken_bot_v3_multi_asset.py
+    
+    - name: ✅ Completado
+      if: success()
+      run: echo "Bot V3 ejecutado correctamente"
+    
+    - name: ❌ Error
+      if: failure()
+      run: echo "Error en la ejecución"
