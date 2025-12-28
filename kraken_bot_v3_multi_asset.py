@@ -48,7 +48,7 @@ class Config:
     
     # Base trading
     LEVERAGE = int(os.getenv('LEVERAGE', '3'))
-    MIN_BALANCE = float(os.getenv('MIN_BALANCE', '50.0'))
+    MIN_BALANCE = float(os.getenv('MIN_BALANCE', '10.0'))
     
     # Adaptive risk (régimen-dependiente)
     REGIME_LOOKBACK = int(os.getenv('REGIME_LOOKBACK', '30'))
@@ -73,7 +73,7 @@ class Config:
     TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '')
     
     # Mode
-    DRY_RUN = os.getenv('DRY_RUN', 'true').lower() == 'true'
+    DRY_RUN = os.getenv('DRY_RUN', 'true').lower() == 'false'
 
 
 # ═══════════════════════════════════════════════════════════════════════════
