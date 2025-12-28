@@ -1,6 +1,6 @@
 """
-KRAKEN SWING BOT V3 - MULTI-ASSET + ML + ADAPTIVE
-Mejoras: Multi-asset, Correlación, Régimen adaptativo, ML validation
+KRAKEN SWING BOT V3 - MULTI-ASSET + ML + ADAPTIVE (FIXED)
+Fix: reduce_only solo con leverage y solo al cerrar
 """
 
 import os
@@ -48,7 +48,7 @@ class Config:
     
     # Base trading
     LEVERAGE = int(os.getenv('LEVERAGE', '3'))
-    MIN_BALANCE = float(os.getenv('MIN_BALANCE', '10.0'))
+    MIN_BALANCE = float(os.getenv('MIN_BALANCE', '50.0'))
     
     # Adaptive risk (régimen-dependiente)
     REGIME_LOOKBACK = int(os.getenv('REGIME_LOOKBACK', '30'))
@@ -73,11 +73,11 @@ class Config:
     TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '')
     
     # Mode
-    DRY_RUN = os.getenv('DRY_RUN', 'true').lower() == 'false'
+    DRY_RUN = os.getenv('DRY_RUN', 'true').lower() == 'true'
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#                        KRAKEN CLIENT (CORREGIDO)
+#                        KRAKEN CLIENT (FIXED)
 # ═══════════════════════════════════════════════════════════════════════════
 
 class KrakenClient:
@@ -151,7 +151,10 @@ class KrakenClient:
                    leverage: int = None, reduce_only: bool = False) -> dict:
         """
         Coloca orden de mercado.
-        reduce_only: True para cerrar posiciones existentes
+        
+        IMPORTANTE:
+        - reduce_only SOLO funciona con órdenes apalancadas (leverage > 1)
+        - reduce_only SOLO debe usarse al CERRAR posiciones, nunca al abrir
         """
         data = {
             'pair': pair,
@@ -160,19 +163,29 @@ class KrakenClient:
             'volume': str(round(volume, 8))
         }
         
-        if leverage and leverage > 1:
+        # ✅ FIX 1: Primero verificar si hay leverage
+        has_leverage = leverage and leverage > 1
+        
+        if has_leverage:
             data['leverage'] = str(leverage)
         
-        if reduce_only:
+        # ✅ FIX 2: reduce_only SOLO si hay leverage Y se está cerrando
+        if reduce_only and has_leverage:
             data['reduce_only'] = 'true'
+        elif reduce_only and not has_leverage:
+            # Log warning pero no añadir reduce_only
+            print(f"   ⚠️  Advertencia: reduce_only ignorado (sin leverage)")
         
         return self._request('/0/private/AddOrder', data=data, private=True)
     
-    def close_position_fixed(self, pair: str, position_type: str, volume: float) -> dict:
+    def close_position_fixed(self, pair: str, position_type: str, volume: float, 
+                           leverage: int = None) -> dict:
         """
         CORRECCIÓN: Cierra posición creando orden opuesta.
         Si tienes LONG (buy), creas SELL para cerrar.
         Si tienes SHORT (sell), creas BUY para cerrar.
+        
+        ✅ FIX: Pasamos leverage para que reduce_only funcione
         """
         opposite_type = 'sell' if position_type == 'long' else 'buy'
         
@@ -180,7 +193,8 @@ class KrakenClient:
             pair=pair,
             order_type=opposite_type,
             volume=volume,
-            reduce_only=True  # Importante: solo reduce, no abre nueva
+            leverage=leverage,  # ✅ Importante: pasar leverage
+            reduce_only=True    # Solo funciona si leverage > 1
         )
 
 
@@ -193,25 +207,19 @@ class RegimeDetector:
     
     @staticmethod
     def detect(data: pd.DataFrame, lookback: int = 30) -> str:
-        """
-        Retorna: 'TRENDING', 'RANGING', 'VOLATILE'
-        """
         if len(data) < lookback:
             return 'RANGING'
         
         recent = data.tail(lookback)
         returns = recent['Close'].pct_change().dropna()
         
-        # Volatilidad
         volatility = returns.std()
         avg_volatility = data['Close'].pct_change().dropna().std()
         
-        # Tendencia (ADX simplificado)
         high_low = (recent['High'] - recent['Low']).mean()
         close_change = abs(recent['Close'].iloc[-1] - recent['Close'].iloc[0])
         trend_strength = close_change / (high_low * lookback) if high_low > 0 else 0
         
-        # Clasificación
         if volatility > avg_volatility * 1.5:
             return 'VOLATILE'
         elif trend_strength > 0.5:
@@ -222,21 +230,19 @@ class RegimeDetector:
     @staticmethod
     def get_adapted_params(regime: str, base_sl: float, base_tp: float, 
                           base_trail: float) -> Dict[str, float]:
-        """Ajusta parámetros según régimen."""
-        
         adaptations = {
             'TRENDING': {
-                'stop_loss_multiplier': 1.2,      # Más amplio
-                'take_profit_multiplier': 1.5,    # Más ambicioso
+                'stop_loss_multiplier': 1.2,
+                'take_profit_multiplier': 1.5,
                 'trailing_stop_multiplier': 1.0,
             },
             'RANGING': {
-                'stop_loss_multiplier': 0.8,      # Más ajustado
-                'take_profit_multiplier': 0.7,    # Más conservador
+                'stop_loss_multiplier': 0.8,
+                'take_profit_multiplier': 0.7,
                 'trailing_stop_multiplier': 0.8,
             },
             'VOLATILE': {
-                'stop_loss_multiplier': 1.5,      # Mucho más amplio
+                'stop_loss_multiplier': 1.5,
                 'take_profit_multiplier': 1.0,
                 'trailing_stop_multiplier': 1.3,
             }
@@ -256,38 +262,28 @@ class RegimeDetector:
 # ═══════════════════════════════════════════════════════════════════════════
 
 class MLSwingValidator:
-    """Valida swing points usando features técnicos como proxy de ML."""
-    
     @staticmethod
     def calculate_features(data: pd.DataFrame, swing_idx: int) -> Dict[str, float]:
-        """Calcula features alrededor del swing point."""
-        
         if swing_idx < 20 or swing_idx >= len(data) - 5:
             return None
         
         window = data.iloc[swing_idx-20:swing_idx+5]
-        
-        # Features
         features = {}
         
-        # 1. Volume confirmation
         avg_vol = window['Volume'].mean()
         swing_vol = data['Volume'].iloc[swing_idx]
         features['volume_ratio'] = swing_vol / avg_vol if avg_vol > 0 else 1.0
         
-        # 2. Price momentum
         returns = window['Close'].pct_change()
         features['momentum'] = returns.mean()
         features['volatility'] = returns.std()
         
-        # 3. Range analysis
         swing_price = data['Close'].iloc[swing_idx]
         recent_high = window['High'].max()
         recent_low = window['Low'].min()
         price_range = recent_high - recent_low
         features['price_position'] = (swing_price - recent_low) / price_range if price_range > 0 else 0.5
         
-        # 4. Trend strength
         sma_20 = window['Close'].mean()
         features['distance_from_sma'] = abs(swing_price - sma_20) / sma_20 if sma_20 > 0 else 0
         
@@ -296,27 +292,20 @@ class MLSwingValidator:
     @staticmethod
     def validate_swing(data: pd.DataFrame, swing_idx: int, 
                       swing_type: str, threshold: float = 0.6) -> Tuple[bool, float]:
-        """
-        Valida si el swing es confiable.
-        Retorna: (is_valid, confidence)
-        """
         features = MLSwingValidator.calculate_features(data, swing_idx)
         
         if features is None:
             return False, 0.0
         
-        # Scoring simple (proxy de ML)
         score = 0.0
         weights = 0.0
         
-        # Volume confirmation (peso: 0.3)
         if features['volume_ratio'] > 1.2:
             score += 0.3
         elif features['volume_ratio'] > 0.8:
             score += 0.15
         weights += 0.3
         
-        # Momentum clarity (peso: 0.25)
         if swing_type == 'LOW' and features['momentum'] < -0.001:
             score += 0.25
         elif swing_type == 'HIGH' and features['momentum'] > 0.001:
@@ -325,20 +314,17 @@ class MLSwingValidator:
             score += 0.125
         weights += 0.25
         
-        # Position in range (peso: 0.2)
         if swing_type == 'LOW' and features['price_position'] < 0.3:
             score += 0.2
         elif swing_type == 'HIGH' and features['price_position'] > 0.7:
             score += 0.2
         weights += 0.2
         
-        # Distance from SMA (peso: 0.15)
-        if features['distance_from_sma'] > 0.02:  # Lejos de media
+        if features['distance_from_sma'] > 0.02:
             score += 0.15
         weights += 0.15
         
-        # Volatility check (peso: 0.1)
-        if features['volatility'] > 0.01:  # Suficiente movimiento
+        if features['volatility'] > 0.01:
             score += 0.1
         weights += 0.1
         
@@ -353,13 +339,9 @@ class MLSwingValidator:
 # ═══════════════════════════════════════════════════════════════════════════
 
 class CorrelationManager:
-    """Gestiona correlaciones entre assets para diversificación."""
-    
     @staticmethod
     def calculate_correlation_matrix(data_dict: Dict[str, pd.DataFrame], 
                                      lookback: int = 30) -> pd.DataFrame:
-        """Calcula matriz de correlación entre múltiples assets."""
-        
         returns_dict = {}
         for symbol, data in data_dict.items():
             if len(data) >= lookback:
@@ -369,10 +351,7 @@ class CorrelationManager:
         if len(returns_dict) < 2:
             return pd.DataFrame()
         
-        # Crear DataFrame de retornos
         returns_df = pd.DataFrame(returns_dict)
-        
-        # Calcular correlación
         corr_matrix = returns_df.corr()
         
         return corr_matrix
@@ -381,11 +360,6 @@ class CorrelationManager:
     def check_position_correlation(open_positions: List[str], new_symbol: str,
                                    corr_matrix: pd.DataFrame, 
                                    max_corr: float = 0.7) -> Tuple[bool, float]:
-        """
-        Verifica si añadir nueva posición viola límite de correlación.
-        Retorna: (can_open, max_correlation_found)
-        """
-        
         if corr_matrix.empty or new_symbol not in corr_matrix.columns:
             return True, 0.0
         
@@ -402,7 +376,7 @@ class CorrelationManager:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#                        SWING DETECTOR V3 (con ML)
+#                        SWING DETECTOR V3
 # ═══════════════════════════════════════════════════════════════════════════
 
 def calculate_volume_ma(data: pd.DataFrame, period: int = 20) -> pd.Series:
@@ -433,11 +407,9 @@ class SwingDetectorV3:
         return self.data['Volume'].iloc[i] > self.volume_ma.iloc[i]
     
     def detect(self):
-        """Detecta todos los swing points con validación ML."""
         highs = self.data['High'].values
         lows = self.data['Low'].values
         
-        # Short-term
         for i in range(1, len(lows) - 1):
             if lows[i] < lows[i-1] and lows[i] < lows[i+1]:
                 if self._check_volume(i):
@@ -448,13 +420,11 @@ class SwingDetectorV3:
                 if self._check_volume(i):
                     self.st_highs.iloc[i] = highs[i]
         
-        # Intermediate
         st_high_idx = self.st_highs.dropna().index.tolist()
         for i in range(1, len(st_high_idx) - 1):
             p, c, n = st_high_idx[i-1], st_high_idx[i], st_high_idx[i+1]
             
             if self.st_highs[c] > self.st_highs[p] and self.st_highs[c] > self.st_highs[n]:
-                # ML Validation
                 if self.use_ml:
                     idx = self.data.index.get_loc(c)
                     is_valid, confidence = MLSwingValidator.validate_swing(
@@ -471,7 +441,6 @@ class SwingDetectorV3:
             p, c, n = st_low_idx[i-1], st_low_idx[i], st_low_idx[i+1]
             
             if self.st_lows[c] < self.st_lows[p] and self.st_lows[c] < self.st_lows[n]:
-                # ML Validation
                 if self.use_ml:
                     idx = self.data.index.get_loc(c)
                     is_valid, confidence = MLSwingValidator.validate_swing(
@@ -484,7 +453,6 @@ class SwingDetectorV3:
                     self.int_lows[c] = self.st_lows[c]
     
     def get_signal(self) -> Tuple[Optional[str], Optional[float], float]:
-        """Retorna última señal (BUY/SELL, precio, confidence)."""
         self.detect()
         
         highs = self.int_highs.dropna()
@@ -544,24 +512,19 @@ class PositionManagerV3:
         self.kraken = kraken
         self.telegram = telegram
         self.peak_prices = {}
-        self.position_regimes = {}  # Almacenar régimen al abrir
+        self.position_regimes = {}
     
     def check_position(self, pos_id: str, pos_data: dict, current_price: float,
                       regime_params: Dict[str, float]) -> Tuple[bool, str]:
-        """
-        Analiza posición con parámetros adaptativos.
-        """
         pos_type = pos_data.get('type', 'long')
         entry_price = float(pos_data.get('cost', 0)) / float(pos_data.get('vol', 1))
         leverage = float(pos_data.get('leverage', 1))
         
-        # PnL
         if pos_type == 'long':
             pnl_pct = ((current_price - entry_price) / entry_price) * 100 * leverage
         else:
             pnl_pct = ((entry_price - current_price) / entry_price) * 100 * leverage
         
-        # Usar parámetros adaptativos
         stop_loss = regime_params['stop_loss']
         take_profit = regime_params['take_profit']
         trailing_stop = regime_params['trailing_stop']
@@ -569,15 +532,12 @@ class PositionManagerV3:
         print(f"   {pos_type.upper()}: entrada ${entry_price:.4f}, actual ${current_price:.4f}")
         print(f"   PnL: {pnl_pct:+.2f}% | SL: {stop_loss:.1f}% | TP: {take_profit:.1f}%")
         
-        # Stop Loss
         if pnl_pct <= -stop_loss:
             return True, f"🛑 Stop Loss: {pnl_pct:.2f}%"
         
-        # Take Profit
         if pnl_pct >= take_profit:
             return True, f"🎯 Take Profit: {pnl_pct:.2f}%"
         
-        # Trailing Stop
         if pnl_pct >= self.config.MIN_PROFIT_FOR_TRAILING:
             if pos_id not in self.peak_prices:
                 self.peak_prices[pos_id] = current_price
@@ -602,13 +562,17 @@ class PositionManagerV3:
     
     def close_position(self, pair: str, pos_type: str, volume: float, 
                       reason: str, pos_data: dict, current_price: float):
-        """Cierra posición usando método corregido."""
         print(f"\n🔴 Cerrando {pair} ({pos_type})")
         print(f"   Razón: {reason}")
         
+        # ✅ Obtener leverage de la posición
+        leverage = int(float(pos_data.get('leverage', 1)))
+        
         if not self.config.DRY_RUN:
             try:
-                result = self.kraken.close_position_fixed(pair, pos_type, volume)
+                result = self.kraken.close_position_fixed(
+                    pair, pos_type, volume, leverage  # ✅ Pasar leverage
+                )
                 print(f"   ✓ Cerrada: {result}")
             except Exception as e:
                 print(f"   ❌ Error: {e}")
@@ -647,7 +611,6 @@ class TradingBotV3:
         self.position_mgr = PositionManagerV3(config, self.kraken, self.telegram)
     
     def get_market_data(self, symbol: str) -> pd.DataFrame:
-        """Descarga datos de yfinance."""
         ticker = yf.Ticker(symbol)
         data = ticker.history(period=self.config.LOOKBACK_PERIOD, 
                             interval=self.config.CANDLE_INTERVAL)
@@ -658,9 +621,8 @@ class TradingBotV3:
         return data
     
     def run(self):
-        """Ciclo principal multi-asset."""
         print("\n" + "="*70)
-        print("KRAKEN SWING BOT V3 - MULTI-ASSET + ML + ADAPTIVE")
+        print("KRAKEN SWING BOT V3 - MULTI-ASSET + ML + ADAPTIVE (FIXED)")
         print("="*70)
         print(f"Fecha: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"Modo: {'🧪 SIMULACIÓN' if self.config.DRY_RUN else '💰 REAL'}")
@@ -675,7 +637,6 @@ class TradingBotV3:
                 print(f"⚠️  Balance insuficiente (min: {self.config.MIN_BALANCE})")
                 return
             
-            # 1. Obtener datos de todos los pares
             print("\n📊 Descargando datos multi-asset...")
             market_data = {}
             for pair in self.config.TRADING_PAIRS:
@@ -690,7 +651,6 @@ class TradingBotV3:
                 print("❌ No se pudieron descargar datos")
                 return
             
-            # 2. Calcular matriz de correlación
             print("\n🔗 Calculando correlaciones...")
             corr_matrix = CorrelationManager.calculate_correlation_matrix(
                 market_data, lookback=30
@@ -700,7 +660,6 @@ class TradingBotV3:
                 print("   Matriz de correlación:")
                 print(corr_matrix.round(2))
             
-            # 3. Verificar posiciones abiertas
             print("\n📊 Verificando posiciones...")
             positions = self.kraken.get_open_positions()
             
@@ -711,7 +670,6 @@ class TradingBotV3:
                 for pos_id, pos_data in positions.items():
                     pair = pos_data.get('pair', 'UNKNOWN')
                     
-                    # Encontrar TradingPair correspondiente
                     trading_pair = next(
                         (tp for tp in self.config.TRADING_PAIRS if tp.kraken_pair == pair),
                         None
@@ -724,7 +682,6 @@ class TradingBotV3:
                     data = market_data[trading_pair.yf_symbol]
                     current_price = float(data['Close'].iloc[-1])
                     
-                    # Detectar régimen
                     regime = RegimeDetector.detect(data, self.config.REGIME_LOOKBACK)
                     regime_params = RegimeDetector.get_adapted_params(
                         regime, 
@@ -750,7 +707,6 @@ class TradingBotV3:
             else:
                 print("✓ No hay posiciones abiertas")
             
-            # 4. Buscar nuevas señales
             if len(open_symbols) >= self.config.MAX_POSITIONS:
                 print(f"\nℹ️  Máximo de posiciones alcanzado ({self.config.MAX_POSITIONS})")
                 return
@@ -767,11 +723,8 @@ class TradingBotV3:
                     continue
                 
                 data = market_data[pair.yf_symbol]
-                
-                # Detectar régimen
                 regime = RegimeDetector.detect(data, self.config.REGIME_LOOKBACK)
                 
-                # Detectar swing
                 detector = SwingDetectorV3(
                     data, 
                     volume_filter=self.config.USE_VOLUME_FILTER,
@@ -781,7 +734,6 @@ class TradingBotV3:
                 signal, signal_price, confidence = detector.get_signal()
                 
                 if signal:
-                    # Verificar correlación
                     can_open, max_corr = CorrelationManager.check_position_correlation(
                         open_symbols, pair.yf_symbol, corr_matrix, self.config.MAX_CORRELATION
                     )
@@ -802,12 +754,10 @@ class TradingBotV3:
                 else:
                     print(f"   - {pair.yf_symbol}: sin señal")
             
-            # 5. Abrir nuevas posiciones
             if not signals:
                 print("\nℹ️  No hay señales válidas")
                 return
             
-            # Ordenar por confianza
             signals.sort(key=lambda x: x['confidence'], reverse=True)
             
             for sig in signals[:self.config.MAX_POSITIONS - len(open_symbols)]:
@@ -822,7 +772,7 @@ class TradingBotV3:
             raise
     
     def open_position(self, signal_data: Dict):
-        """Abre nueva posición."""
+        """✅ FIX: No usar reduce_only al abrir posiciones"""
         pair = signal_data['pair']
         signal = signal_data['signal']
         confidence = signal_data['confidence']
@@ -836,7 +786,6 @@ class TradingBotV3:
             current_price = float(signal_data['data']['Close'].iloc[-1])
             volume = effective / current_price
             
-            # Ajustar volumen al mínimo
             if volume < pair.min_volume:
                 print(f"⚠️  {pair.yf_symbol}: volumen {volume:.6f} < mínimo {pair.min_volume}")
                 return
@@ -856,7 +805,8 @@ class TradingBotV3:
                     pair=pair.kraken_pair,
                     order_type=order_type,
                     volume=volume,
-                    leverage=self.config.LEVERAGE
+                    leverage=self.config.LEVERAGE,
+                    reduce_only=False  # ✅ NUNCA usar reduce_only al abrir
                 )
                 print(f"   ✓ Ejecutada: {result}")
             else:
