@@ -148,8 +148,9 @@ class KrakenClient:
     
     def get_open_positions(self) -> Dict:
         """
-        ✅ MEJORADO: Retorna solo posiciones REALMENTE abiertas
-        Filtra posiciones cerradas, canceladas o inválidas
+        ✅ MEJORADO: Retorna posiciones consolidadas por par
+        - Filtra posiciones cerradas
+        - Consolida múltiples posiciones del mismo par
         """
         try:
             result = self._request('/0/private/OpenPositions', private=True)
@@ -157,23 +158,38 @@ class KrakenClient:
             if not result:
                 return {}
             
-            # ✅ Filtrar solo posiciones válidas con volumen > 0
-            valid_positions = {}
+            # ✅ Consolidar posiciones por par
+            consolidated = {}
             
             for pos_id, pos_data in result.items():
                 vol = float(pos_data.get('vol', 0))
                 vol_closed = float(pos_data.get('vol_closed', 0))
-                
-                # Solo considerar posiciones con volumen abierto
                 open_vol = vol - vol_closed
                 
-                if open_vol > 0:
-                    valid_positions[pos_id] = pos_data
-                    print(f"   ✓ Posición válida: {pos_data.get('pair')} - Vol: {open_vol:.8f}")
+                if open_vol <= 0:
+                    continue
+                
+                pair = pos_data.get('pair', 'UNKNOWN')
+                
+                # Si ya existe posición de este par, consolidar
+                if pair in consolidated:
+                    # Sumar volumen
+                    existing_vol = float(consolidated[pair].get('vol', 0))
+                    consolidated[pair]['vol'] = str(existing_vol + open_vol)
+                    
+                    # Usar el cost total (aproximado)
+                    existing_cost = float(consolidated[pair].get('cost', 0))
+                    new_cost = float(pos_data.get('cost', 0))
+                    consolidated[pair]['cost'] = str(existing_cost + new_cost)
+                    
+                    print(f"   🔄 Consolidando {pair}: +{open_vol:.8f} → Total: {float(consolidated[pair]['vol']):.8f}")
                 else:
-                    print(f"   ⚠️ Posición cerrada ignorada: {pos_data.get('pair')} - Vol: {open_vol:.8f}")
+                    # Primera posición de este par
+                    pos_data['vol'] = str(open_vol)
+                    consolidated[pair] = pos_data
+                    print(f"   ✓ Posición nueva: {pair} - Vol: {open_vol:.8f}")
             
-            return valid_positions
+            return consolidated
             
         except Exception as e:
             if "No open positions" in str(e) or "positions" not in str(e).lower():
@@ -736,7 +752,7 @@ class TradingBotV3:
             
             # ✅ MEJORADO: Verificación más robusta de posiciones
             print("\n📊 Verificando posiciones ABIERTAS...")
-            positions = self.kraken.get_open_positions()  # Ya filtradas
+            positions = self.kraken.get_open_positions()  # Ya consolidadas por par
             
             # También verificar órdenes (para debug)
             orders = self.kraken.get_open_orders()
@@ -744,17 +760,17 @@ class TradingBotV3:
             open_symbols = []
             total_margin_used = 0.0
             
-            # ✅ IMPORTANTE: Contar solo posiciones VÁLIDAS
+            # ✅ IMPORTANTE: Ahora positions está indexado por PAR, no por position_id
             valid_position_count = len(positions)
             
-            print(f"✅ {valid_position_count} posición(es) REALMENTE abierta(s)")
+            print(f"✅ {valid_position_count} posición(es) únicas (consolidadas por par)")
             
             if orders:
                 print(f"📋 {len(orders)} orden(es) pendiente(s) (no se cuentan como posiciones)")
             
             if positions:
-                for pos_id, pos_data in positions.items():
-                    pair = pos_data.get('pair', 'UNKNOWN')
+                # ✅ CAMBIO: Ahora iteramos por PAR, no por position_id
+                for pair, pos_data in positions.items():
                     pos_margin = float(pos_data.get('margin', 0))
                     total_margin_used += pos_margin
                     
@@ -781,8 +797,9 @@ class TradingBotV3:
                     print(f"\n   {trading_pair.yf_symbol} ({pair}) - Régimen: {regime}")
                     print(f"   Margen usado: {pos_margin:.2f} {currency}")
                     
+                    # Usar el par como pos_id
                     should_close, reason = self.position_mgr.check_position(
-                        pos_id, pos_data, current_price, regime_params
+                        pair, pos_data, current_price, regime_params
                     )
                     
                     if should_close:
