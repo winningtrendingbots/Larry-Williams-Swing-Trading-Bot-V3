@@ -52,7 +52,7 @@ class Config:
     
     # Base trading
     LEVERAGE = int(os.getenv('LEVERAGE', '3'))
-    MIN_BALANCE = float(os.getenv('MIN_BALANCE', '50.0'))
+    MIN_BALANCE = float(os.getenv('MIN_BALANCE', '10.0'))
     
     # ✅ NUEVO: Margen de seguridad
     MARGIN_SAFETY_FACTOR = 1.5  # Usar solo 66% del margen disponible
@@ -80,7 +80,7 @@ class Config:
     TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '')
     
     # Mode
-    DRY_RUN = os.getenv('DRY_RUN', 'true').lower() == 'true'
+    DRY_RUN = os.getenv('DRY_RUN', 'true').lower() == 'false'
 
 
 # ═══════════════════════════════════════════════════════════════════════════
