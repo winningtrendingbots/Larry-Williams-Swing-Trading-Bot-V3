@@ -1,6 +1,10 @@
 """
 KRAKEN SWING BOT V3 - MULTI-ASSET + ML + ADAPTIVE (FIXED)
-Fix: reduce_only solo con leverage y solo al cerrar
+Correcciones:
+- Verificación de margen disponible antes de abrir posiciones
+- Cálculo correcto de volumen considerando margen requerido
+- Mejor gestión de errores de margen insuficiente
+- Logs más detallados para debugging
 """
 
 import os
@@ -50,10 +54,13 @@ class Config:
     LEVERAGE = int(os.getenv('LEVERAGE', '3'))
     MIN_BALANCE = float(os.getenv('MIN_BALANCE', '50.0'))
     
-    # Adaptive risk (régimen-dependiente)
+    # ✅ NUEVO: Margen de seguridad
+    MARGIN_SAFETY_FACTOR = 1.5  # Usar solo 66% del margen disponible
+    
+    # Adaptive risk
     REGIME_LOOKBACK = int(os.getenv('REGIME_LOOKBACK', '30'))
     
-    # Risk base (se ajustan según régimen)
+    # Risk base
     BASE_STOP_LOSS = float(os.getenv('STOP_LOSS_PCT', '4.0'))
     BASE_TAKE_PROFIT = float(os.getenv('TAKE_PROFIT_PCT', '8.0'))
     BASE_TRAILING_STOP = float(os.getenv('TRAILING_STOP_PCT', '2.5'))
@@ -129,6 +136,27 @@ class KrakenClient:
         
         return 0.0, 'EUR'
     
+    def get_available_margin(self) -> float:
+        """
+        ✅ NUEVO: Obtiene el margen disponible para trading.
+        Retorna el margen libre que puede usarse para nuevas posiciones.
+        """
+        try:
+            result = self._request('/0/private/TradeBalance', private=True)
+            
+            # Margen libre = equity - margen usado - margen requerido para órdenes
+            # mf = margin free
+            margin_free = float(result.get('mf', 0))
+            
+            print(f"   💰 Margen disponible: {margin_free:.2f} EUR")
+            
+            return margin_free
+        except Exception as e:
+            print(f"   ⚠️  Error obteniendo margen: {e}")
+            # Fallback: usar balance total
+            balance, _ = self.get_balance()
+            return balance * 0.5  # Usar 50% como margen disponible estimado
+    
     def get_open_positions(self) -> Dict:
         """Retorna posiciones abiertas."""
         try:
@@ -154,7 +182,7 @@ class KrakenClient:
         
         IMPORTANTE:
         - reduce_only SOLO funciona con órdenes apalancadas (leverage > 1)
-        - reduce_only SOLO debe usarse al CERRAR posiciones, nunca al abrir
+        - reduce_only SOLO debe usarse al CERRAR posiciones
         """
         data = {
             'pair': pair,
@@ -163,29 +191,24 @@ class KrakenClient:
             'volume': str(round(volume, 8))
         }
         
-        # ✅ FIX 1: Primero verificar si hay leverage
         has_leverage = leverage and leverage > 1
         
         if has_leverage:
             data['leverage'] = str(leverage)
         
-        # ✅ FIX 2: reduce_only SOLO si hay leverage Y se está cerrando
         if reduce_only and has_leverage:
             data['reduce_only'] = 'true'
         elif reduce_only and not has_leverage:
-            # Log warning pero no añadir reduce_only
             print(f"   ⚠️  Advertencia: reduce_only ignorado (sin leverage)")
+        
+        print(f"   📤 Orden: {data}")
         
         return self._request('/0/private/AddOrder', data=data, private=True)
     
     def close_position_fixed(self, pair: str, position_type: str, volume: float, 
                            leverage: int = None) -> dict:
         """
-        CORRECCIÓN: Cierra posición creando orden opuesta.
-        Si tienes LONG (buy), creas SELL para cerrar.
-        Si tienes SHORT (sell), creas BUY para cerrar.
-        
-        ✅ FIX: Pasamos leverage para que reduce_only funcione
+        Cierra posición creando orden opuesta con reduce_only.
         """
         opposite_type = 'sell' if position_type == 'long' else 'buy'
         
@@ -193,8 +216,8 @@ class KrakenClient:
             pair=pair,
             order_type=opposite_type,
             volume=volume,
-            leverage=leverage,  # ✅ Importante: pasar leverage
-            reduce_only=True    # Solo funciona si leverage > 1
+            leverage=leverage,
+            reduce_only=True
         )
 
 
@@ -565,23 +588,28 @@ class PositionManagerV3:
         print(f"\n🔴 Cerrando {pair} ({pos_type})")
         print(f"   Razón: {reason}")
         
-        # ✅ Obtener leverage de la posición
         leverage = int(float(pos_data.get('leverage', 1)))
         
         if not self.config.DRY_RUN:
             try:
                 result = self.kraken.close_position_fixed(
-                    pair, pos_type, volume, leverage  # ✅ Pasar leverage
+                    pair, pos_type, volume, leverage
                 )
                 print(f"   ✓ Cerrada: {result}")
             except Exception as e:
-                print(f"   ❌ Error: {e}")
-                self.telegram.send(f"❌ Error cerrando {pair}: {e}")
+                error_msg = str(e)
+                print(f"   ❌ Error: {error_msg}")
+                self.telegram.send(f"❌ Error cerrando {pair}: {error_msg}")
                 return
         else:
             print(f"   🧪 [SIMULACIÓN]")
         
         entry = float(pos_data.get('cost', 0)) / float(pos_data.get('vol', 1))
+        
+        if pos_type == 'long':
+            pnl_pct = ((current_price - entry) / entry) * 100 * leverage
+        else:
+            pnl_pct = ((entry - current_price) / entry) * 100 * leverage
         
         msg = f"""
 🔴 <b>POSICIÓN CERRADA</b>
@@ -590,6 +618,7 @@ class PositionManagerV3:
 <b>Tipo:</b> {pos_type.upper()}
 <b>Entrada:</b> ${entry:.4f}
 <b>Salida:</b> ${current_price:.4f}
+<b>PnL:</b> {pnl_pct:+.2f}%
 <b>Razón:</b> {reason}
 """
         if self.config.DRY_RUN:
@@ -620,6 +649,23 @@ class TradingBotV3:
         
         return data
     
+    def calculate_required_margin(self, price: float, volume: float, 
+                                  leverage: int) -> float:
+        """
+        ✅ NUEVO: Calcula el margen requerido para una posición.
+        
+        Margen requerido = (Precio * Volumen) / Leverage
+        
+        Añadimos factor de seguridad para fees y slippage.
+        """
+        position_size = price * volume
+        margin_required = position_size / leverage
+        
+        # Factor de seguridad: 10% adicional para fees, slippage, etc.
+        margin_with_safety = margin_required * 1.1
+        
+        return margin_with_safety
+    
     def run(self):
         print("\n" + "="*70)
         print("KRAKEN SWING BOT V3 - MULTI-ASSET + ML + ADAPTIVE (FIXED)")
@@ -630,12 +676,20 @@ class TradingBotV3:
         print("="*70)
         
         try:
+            # Obtener balance y margen disponible
             balance, currency = self.kraken.get_balance()
+            available_margin = self.kraken.get_available_margin()
+            
             print(f"\n💰 Balance: {balance:.2f} {currency}")
+            print(f"   Margen disponible: {available_margin:.2f} {currency}")
             
             if balance < self.config.MIN_BALANCE:
                 print(f"⚠️  Balance insuficiente (min: {self.config.MIN_BALANCE})")
                 return
+            
+            # Calcular margen usable (con factor de seguridad)
+            usable_margin = available_margin / self.config.MARGIN_SAFETY_FACTOR
+            print(f"   Margen usable (con seguridad): {usable_margin:.2f} {currency}")
             
             print("\n📊 Descargando datos multi-asset...")
             market_data = {}
@@ -664,11 +718,17 @@ class TradingBotV3:
             positions = self.kraken.get_open_positions()
             
             open_symbols = []
+            total_margin_used = 0.0
+            
             if positions:
                 print(f"✓ {len(positions)} posición(es) abierta(s)")
                 
                 for pos_id, pos_data in positions.items():
                     pair = pos_data.get('pair', 'UNKNOWN')
+                    
+                    # Calcular margen usado por esta posición
+                    pos_margin = float(pos_data.get('margin', 0))
+                    total_margin_used += pos_margin
                     
                     trading_pair = next(
                         (tp for tp in self.config.TRADING_PAIRS if tp.kraken_pair == pair),
@@ -691,6 +751,7 @@ class TradingBotV3:
                     )
                     
                     print(f"\n   {trading_pair.yf_symbol} ({pair}) - Régimen: {regime}")
+                    print(f"   Margen usado: {pos_margin:.2f} {currency}")
                     
                     should_close, reason = self.position_mgr.check_position(
                         pos_id, pos_data, current_price, regime_params
@@ -702,13 +763,25 @@ class TradingBotV3:
                         self.position_mgr.close_position(
                             pair, pos_type, volume, reason, pos_data, current_price
                         )
+                        total_margin_used -= pos_margin  # Liberar margen
                     else:
                         print(f"   ✓ Mantener posición")
             else:
                 print("✓ No hay posiciones abiertas")
             
+            print(f"\n💰 Margen usado: {total_margin_used:.2f} {currency}")
+            print(f"   Margen restante: {(available_margin - total_margin_used):.2f} {currency}")
+            
             if len(open_symbols) >= self.config.MAX_POSITIONS:
                 print(f"\nℹ️  Máximo de posiciones alcanzado ({self.config.MAX_POSITIONS})")
+                return
+            
+            # Calcular margen disponible para nuevas posiciones
+            margin_for_new = (available_margin - total_margin_used) / self.config.MARGIN_SAFETY_FACTOR
+            print(f"   Margen para nuevas posiciones: {margin_for_new:.2f} {currency}")
+            
+            if margin_for_new < self.config.MIN_BALANCE * 0.5:
+                print(f"⚠️  Margen insuficiente para nuevas posiciones")
                 return
             
             print("\n🔍 Buscando señales en activos disponibles...")
@@ -723,6 +796,7 @@ class TradingBotV3:
                     continue
                 
                 data = market_data[pair.yf_symbol]
+                current_price = float(data['Close'].iloc[-1])
                 regime = RegimeDetector.detect(data, self.config.REGIME_LOOKBACK)
                 
                 detector = SwingDetectorV3(
@@ -734,6 +808,28 @@ class TradingBotV3:
                 signal, signal_price, confidence = detector.get_signal()
                 
                 if signal:
+                    # ✅ Verificar si hay suficiente margen ANTES de verificar correlación
+                    # Calcular volumen tentativo
+                    allocation_margin = margin_for_new * pair.allocation
+                    effective_capital = allocation_margin * self.config.LEVERAGE
+                    tentative_volume = effective_capital / current_price
+                    
+                    # Calcular margen requerido
+                    required_margin = self.calculate_required_margin(
+                        current_price, tentative_volume, self.config.LEVERAGE
+                    )
+                    
+                    if required_margin > allocation_margin:
+                        print(f"   ⚠️  {pair.yf_symbol}: margen insuficiente "
+                              f"(necesita {required_margin:.2f}, disponible {allocation_margin:.2f})")
+                        continue
+                    
+                    # Verificar volumen mínimo
+                    if tentative_volume < pair.min_volume:
+                        print(f"   ⚠️  {pair.yf_symbol}: volumen {tentative_volume:.6f} < mínimo {pair.min_volume}")
+                        continue
+                    
+                    # Ahora sí, verificar correlación
                     can_open, max_corr = CorrelationManager.check_position_correlation(
                         open_symbols, pair.yf_symbol, corr_matrix, self.config.MAX_CORRELATION
                     )
@@ -742,13 +838,15 @@ class TradingBotV3:
                         signals.append({
                             'pair': pair,
                             'signal': signal,
-                            'price': signal_price,
+                            'price': current_price,
                             'confidence': confidence,
                             'regime': regime,
-                            'data': data
+                            'data': data,
+                            'volume': tentative_volume,
+                            'required_margin': required_margin
                         })
                         print(f"   ✓ {pair.yf_symbol}: {signal} (conf: {confidence:.2f}, "
-                              f"régimen: {regime}, corr: {max_corr:.2f})")
+                              f"régimen: {regime}, corr: {max_corr:.2f}, margen: {required_margin:.2f})")
                     else:
                         print(f"   ⚠️  {pair.yf_symbol}: {signal} rechazado por correlación ({max_corr:.2f})")
                 else:
@@ -758,57 +856,87 @@ class TradingBotV3:
                 print("\nℹ️  No hay señales válidas")
                 return
             
+            # Ordenar por confianza
             signals.sort(key=lambda x: x['confidence'], reverse=True)
             
-            for sig in signals[:self.config.MAX_POSITIONS - len(open_symbols)]:
-                self.open_position(sig)
+            # Abrir posiciones hasta el límite
+            positions_to_open = min(
+                len(signals), 
+                self.config.MAX_POSITIONS - len(open_symbols)
+            )
+            
+            for sig in signals[:positions_to_open]:
+                self.open_position(sig, margin_for_new)
             
             print("\n✅ Ciclo completado")
             
         except Exception as e:
             msg = f"Error: {str(e)}"
             print(f"\n❌ {msg}")
+            import traceback
+            traceback.print_exc()
             self.telegram.send(f"❌ {msg}")
             raise
     
-    def open_position(self, signal_data: Dict):
-        """✅ FIX: No usar reduce_only al abrir posiciones"""
+    def open_position(self, signal_data: Dict, available_margin: float):
+        """
+        ✅ MEJORADO: Abre posición con verificación de margen.
+        """
         pair = signal_data['pair']
         signal = signal_data['signal']
         confidence = signal_data['confidence']
         regime = signal_data['regime']
+        volume = signal_data['volume']
+        required_margin = signal_data['required_margin']
+        current_price = signal_data['price']
         
         try:
-            balance, currency = self.kraken.get_balance()
-            
-            capital = balance * pair.allocation
-            effective = capital * self.config.LEVERAGE
-            current_price = float(signal_data['data']['Close'].iloc[-1])
-            volume = effective / current_price
-            
-            if volume < pair.min_volume:
-                print(f"⚠️  {pair.yf_symbol}: volumen {volume:.6f} < mínimo {pair.min_volume}")
-                return
-            
-            volume = round(volume, 8)
-            
             print(f"\n🟢 Abriendo {signal} en {pair.yf_symbol}")
-            print(f"   Capital: {capital:.2f} {currency} ({pair.allocation*100}%)")
+            print(f"   Precio: ${current_price:.4f}")
+            print(f"   Volumen: {volume:.8f}")
             print(f"   Leverage: {self.config.LEVERAGE}x")
-            print(f"   Volumen: {volume} @ ${current_price:.4f}")
+            print(f"   Margen requerido: {required_margin:.2f} EUR")
             print(f"   Confianza ML: {confidence:.2f}")
             print(f"   Régimen: {regime}")
             
             if not self.config.DRY_RUN:
                 order_type = 'buy' if signal == 'BUY' else 'sell'
-                result = self.kraken.place_order(
-                    pair=pair.kraken_pair,
-                    order_type=order_type,
-                    volume=volume,
-                    leverage=self.config.LEVERAGE,
-                    reduce_only=False  # ✅ NUNCA usar reduce_only al abrir
-                )
-                print(f"   ✓ Ejecutada: {result}")
+                
+                try:
+                    result = self.kraken.place_order(
+                        pair=pair.kraken_pair,
+                        order_type=order_type,
+                        volume=volume,
+                        leverage=self.config.LEVERAGE,
+                        reduce_only=False
+                    )
+                    print(f"   ✓ Ejecutada: {result}")
+                    
+                except Exception as e:
+                    error_msg = str(e)
+                    print(f"   ❌ Error ejecutando orden: {error_msg}")
+                    
+                    # Si el error es de margen insuficiente, intentar con volumen reducido
+                    if "insufficient" in error_msg.lower() and "margin" in error_msg.lower():
+                        print(f"   🔄 Intentando con volumen reducido (50%)...")
+                        
+                        reduced_volume = volume * 0.5
+                        
+                        if reduced_volume >= pair.min_volume:
+                            result = self.kraken.place_order(
+                                pair=pair.kraken_pair,
+                                order_type=order_type,
+                                volume=reduced_volume,
+                                leverage=self.config.LEVERAGE,
+                                reduce_only=False
+                            )
+                            print(f"   ✓ Ejecutada con volumen reducido: {result}")
+                            volume = reduced_volume  # Actualizar para el mensaje
+                        else:
+                            print(f"   ❌ Volumen reducido {reduced_volume:.8f} < mínimo {pair.min_volume}")
+                            raise
+                    else:
+                        raise
             else:
                 print(f"   🧪 [SIMULACIÓN]")
             
@@ -818,8 +946,9 @@ class TradingBotV3:
 <b>Par:</b> {pair.yf_symbol} ({pair.kraken_pair})
 <b>Tipo:</b> {signal}
 <b>Precio:</b> ${current_price:.4f}
-<b>Cantidad:</b> {volume}
+<b>Cantidad:</b> {volume:.8f}
 <b>Leverage:</b> {self.config.LEVERAGE}x
+<b>Margen:</b> {required_margin:.2f} EUR
 
 <b>ML Confidence:</b> {confidence:.2%}
 <b>Régimen:</b> {regime}
@@ -831,8 +960,9 @@ class TradingBotV3:
             self.telegram.send(msg)
             
         except Exception as e:
-            print(f"❌ Error abriendo {pair.yf_symbol}: {e}")
-            self.telegram.send(f"❌ Error en {pair.yf_symbol}: {e}")
+            error_msg = str(e)
+            print(f"❌ Error abriendo {pair.yf_symbol}: {error_msg}")
+            self.telegram.send(f"❌ Error en {pair.yf_symbol}: {error_msg}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
