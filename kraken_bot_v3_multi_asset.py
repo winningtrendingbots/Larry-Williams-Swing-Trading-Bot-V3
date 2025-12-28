@@ -52,7 +52,7 @@ class Config:
     
     # Base trading
     LEVERAGE = int(os.getenv('LEVERAGE', '3'))
-    MIN_BALANCE = float(os.getenv('MIN_BALANCE', '10.0'))
+    MIN_BALANCE = float(os.getenv('MIN_BALANCE', '50.0'))
     
     # ✅ NUEVO: Margen de seguridad
     MARGIN_SAFETY_FACTOR = 1.5  # Usar solo 66% del margen disponible
@@ -80,7 +80,7 @@ class Config:
     TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '')
     
     # Mode
-    DRY_RUN = os.getenv('DRY_RUN', 'true').lower() == 'false'
+    DRY_RUN = os.getenv('DRY_RUN', 'true').lower() == 'true'
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -183,6 +183,7 @@ class KrakenClient:
         IMPORTANTE:
         - reduce_only SOLO funciona con órdenes apalancadas (leverage > 1)
         - reduce_only SOLO debe usarse al CERRAR posiciones
+        - Al cerrar, SIEMPRE pasar el leverage original de la posición
         """
         data = {
             'pair': pair,
@@ -193,13 +194,18 @@ class KrakenClient:
         
         has_leverage = leverage and leverage > 1
         
-        if has_leverage:
+        # ✅ SIEMPRE añadir leverage si se proporciona
+        if leverage:
             data['leverage'] = str(leverage)
+            print(f"   📊 Usando leverage: {leverage}x")
         
-        if reduce_only and has_leverage:
-            data['reduce_only'] = 'true'
-        elif reduce_only and not has_leverage:
-            print(f"   ⚠️  Advertencia: reduce_only ignorado (sin leverage)")
+        # ✅ reduce_only SOLO si hay leverage
+        if reduce_only:
+            if has_leverage:
+                data['reduce_only'] = 'true'
+                print(f"   🔒 reduce_only activado")
+            else:
+                print(f"   ⚠️  reduce_only ignorado (leverage={leverage})")
         
         print(f"   📤 Orden: {data}")
         
@@ -588,10 +594,14 @@ class PositionManagerV3:
         print(f"\n🔴 Cerrando {pair} ({pos_type})")
         print(f"   Razón: {reason}")
         
+        # ✅ CRÍTICO: Obtener leverage de la posición original
         leverage = int(float(pos_data.get('leverage', 1)))
+        print(f"   Leverage original: {leverage}x")
+        print(f"   Volumen a cerrar: {volume}")
         
         if not self.config.DRY_RUN:
             try:
+                # ✅ CRÍTICO: Pasar leverage a la función de cierre
                 result = self.kraken.close_position_fixed(
                     pair, pos_type, volume, leverage
                 )
@@ -599,8 +609,28 @@ class PositionManagerV3:
             except Exception as e:
                 error_msg = str(e)
                 print(f"   ❌ Error: {error_msg}")
-                self.telegram.send(f"❌ Error cerrando {pair}: {error_msg}")
-                return
+                
+                # Si falla con reduce_only, intentar sin él
+                if "reduce_only" in error_msg.lower() or "insufficient" in error_msg.lower():
+                    print(f"   🔄 Reintentando sin reduce_only...")
+                    try:
+                        # Crear orden opuesta SIN reduce_only
+                        opposite_type = 'sell' if pos_type == 'long' else 'buy'
+                        result = self.kraken.place_order(
+                            pair=pair,
+                            order_type=opposite_type,
+                            volume=volume,
+                            leverage=leverage,  # ✅ IMPORTANTE: Mantener leverage
+                            reduce_only=False   # Sin reduce_only
+                        )
+                        print(f"   ✓ Cerrada (sin reduce_only): {result}")
+                    except Exception as e2:
+                        print(f"   ❌ Error en segundo intento: {e2}")
+                        self.telegram.send(f"❌ Error cerrando {pair}: {e2}")
+                        return
+                else:
+                    self.telegram.send(f"❌ Error cerrando {pair}: {error_msg}")
+                    return
         else:
             print(f"   🧪 [SIMULACIÓN]")
         
@@ -619,6 +649,7 @@ class PositionManagerV3:
 <b>Entrada:</b> ${entry:.4f}
 <b>Salida:</b> ${current_price:.4f}
 <b>PnL:</b> {pnl_pct:+.2f}%
+<b>Leverage:</b> {leverage}x
 <b>Razón:</b> {reason}
 """
         if self.config.DRY_RUN:
