@@ -1,11 +1,9 @@
 """
-KRAKEN SWING BOT V3 - MULTI-ASSET + ML + ADAPTIVE (FIXED)
+KRAKEN SWING BOT V3 - MULTI-ASSET + ML + ADAPTIVE (FIXED POSITIONS COUNT)
 Correcciones:
-- Verificación de margen disponible antes de abrir posiciones
-- Cálculo correcto de volumen considerando margen requerido
-- Mejor gestión de errores de margen insuficiente
-- FIX: Cierre correcto de posiciones spot vs margin
-- FIX: Indentación corregida
+- Fix: Conteo correcto de posiciones (ignora órdenes cerradas/canceladas)
+- Fix: Verificación mejorada de margen disponible
+- Fix: Limpieza de posiciones fantasma
 """
 
 import os
@@ -29,10 +27,10 @@ import json
 
 @dataclass
 class TradingPair:
-    yf_symbol: str      # Para yfinance
-    kraken_pair: str    # Para Kraken
-    min_volume: float   # Volumen mínimo
-    allocation: float   # % del capital
+    yf_symbol: str
+    kraken_pair: str
+    min_volume: float
+    allocation: float
 
 class Config:
     # Kraken
@@ -55,8 +53,7 @@ class Config:
     LEVERAGE = int(os.getenv('LEVERAGE', '3'))
     MIN_BALANCE = float(os.getenv('MIN_BALANCE', '10.0'))
     
-    # Margen de seguridad
-    MARGIN_SAFETY_FACTOR = 1.5  # Usar solo 66% del margen disponible
+    MARGIN_SAFETY_FACTOR = 1.5
     
     # Adaptive risk
     REGIME_LOOKBACK = int(os.getenv('REGIME_LOOKBACK', '30'))
@@ -81,7 +78,7 @@ class Config:
     TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '')
     
     # Mode
-    DRY_RUN = os.getenv('DRY_RUN', 'true').lower() == 'false'
+    DRY_RUN = os.getenv('DRY_RUN', 'true').lower() == 'true'
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -145,33 +142,64 @@ class KrakenClient:
             print(f"   💰 Margen disponible: {margin_free:.2f} EUR")
             return margin_free
         except Exception as e:
-            print(f"   ⚠️  Error obteniendo margen: {e}")
+            print(f"   ⚠️ Error obteniendo margen: {e}")
             balance, _ = self.get_balance()
             return balance * 0.5
     
     def get_open_positions(self) -> Dict:
-        """Retorna posiciones abiertas."""
+        """
+        ✅ MEJORADO: Retorna solo posiciones REALMENTE abiertas
+        Filtra posiciones cerradas, canceladas o inválidas
+        """
         try:
             result = self._request('/0/private/OpenPositions', private=True)
-            return result if result else {}
+            
+            if not result:
+                return {}
+            
+            # ✅ Filtrar solo posiciones válidas con volumen > 0
+            valid_positions = {}
+            
+            for pos_id, pos_data in result.items():
+                vol = float(pos_data.get('vol', 0))
+                vol_closed = float(pos_data.get('vol_closed', 0))
+                
+                # Solo considerar posiciones con volumen abierto
+                open_vol = vol - vol_closed
+                
+                if open_vol > 0:
+                    valid_positions[pos_id] = pos_data
+                    print(f"   ✓ Posición válida: {pos_data.get('pair')} - Vol: {open_vol:.8f}")
+                else:
+                    print(f"   ⚠️ Posición cerrada ignorada: {pos_data.get('pair')} - Vol: {open_vol:.8f}")
+            
+            return valid_positions
+            
         except Exception as e:
             if "No open positions" in str(e) or "positions" not in str(e).lower():
                 return {}
             raise
     
     def get_open_orders(self) -> Dict:
-        """Obtener órdenes abiertas."""
+        """
+        ✅ MEJORADO: Obtener órdenes abiertas (separado de posiciones)
+        """
         try:
             result = self._request('/0/private/OpenOrders', private=True)
-            return result.get('open', {})
+            orders = result.get('open', {})
+            
+            if orders:
+                print(f"   📋 {len(orders)} orden(es) abierta(s) (no posiciones)")
+                for order_id, order_data in orders.items():
+                    print(f"      - {order_data.get('descr', {}).get('pair')}: {order_data.get('descr', {}).get('type')}")
+            
+            return orders
         except:
             return {}
     
     def place_order(self, pair: str, order_type: str, volume: float, 
                    leverage: int = None, reduce_only: bool = False) -> dict:
-        """
-        ✅ CORREGIDO: Maneja correctamente spot vs margin
-        """
+        """Coloca orden en Kraken."""
         data = {
             'pair': pair,
             'type': order_type,
@@ -179,7 +207,6 @@ class KrakenClient:
             'volume': str(round(volume, 8))
         }
         
-        # ✅ Solo añadir leverage y reduce_only si leverage > 1
         is_margin_trade = leverage and leverage > 1
         
         if is_margin_trade:
@@ -198,19 +225,16 @@ class KrakenClient:
     
     def close_position(self, pair: str, position_type: str, volume: float, 
                       leverage: int = None) -> dict:
-        """
-        ✅ CORREGIDO: Cierra correctamente según tipo (spot/margin)
-        """
+        """Cierra posición correctamente."""
         opposite_type = 'sell' if position_type == 'long' else 'buy'
         is_margin_position = leverage and leverage > 1
         
-        print(f"\n   📍 Cerrando posición {'MARGIN' if is_margin_position else 'SPOT'}")
+        print(f"\n   🔒 Cerrando posición {'MARGIN' if is_margin_position else 'SPOT'}")
         print(f"   Leverage original: {leverage}x")
         print(f"   Tipo: {opposite_type.upper()}")
         print(f"   Volumen: {volume}")
         
         if is_margin_position:
-            # Posición de margen: usar leverage y reduce_only
             return self.place_order(
                 pair=pair,
                 order_type=opposite_type,
@@ -219,7 +243,6 @@ class KrakenClient:
                 reduce_only=True
             )
         else:
-            # Posición spot: orden simple sin parámetros adicionales
             return self.place_order(
                 pair=pair,
                 order_type=opposite_type,
@@ -637,7 +660,7 @@ class PositionManagerV3:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#                        TRADING BOT V3
+#                        TRADING BOT V3 (FIXED)
 # ═══════════════════════════════════════════════════════════════════════════
 
 class TradingBotV3:
@@ -667,7 +690,7 @@ class TradingBotV3:
     
     def run(self):
         print("\n" + "="*70)
-        print("KRAKEN SWING BOT V3 - MULTI-ASSET + ML + ADAPTIVE (FIXED)")
+        print("KRAKEN SWING BOT V3 - FIXED POSITIONS COUNT")
         print("="*70)
         print(f"Fecha: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"Modo: {'🧪 SIMULACIÓN' if self.config.DRY_RUN else '💰 REAL'}")
@@ -682,7 +705,7 @@ class TradingBotV3:
             print(f"   Margen disponible: {available_margin:.2f} {currency}")
             
             if balance < self.config.MIN_BALANCE:
-                print(f"⚠️  Balance insuficiente (min: {self.config.MIN_BALANCE})")
+                print(f"⚠️ Balance insuficiente (min: {self.config.MIN_BALANCE})")
                 return
             
             usable_margin = available_margin / self.config.MARGIN_SAFETY_FACTOR
@@ -711,15 +734,25 @@ class TradingBotV3:
                 print("   Matriz de correlación:")
                 print(corr_matrix.round(2))
             
-            print("\n📊 Verificando posiciones...")
-            positions = self.kraken.get_open_positions()
+            # ✅ MEJORADO: Verificación más robusta de posiciones
+            print("\n📊 Verificando posiciones ABIERTAS...")
+            positions = self.kraken.get_open_positions()  # Ya filtradas
+            
+            # También verificar órdenes (para debug)
+            orders = self.kraken.get_open_orders()
             
             open_symbols = []
             total_margin_used = 0.0
             
+            # ✅ IMPORTANTE: Contar solo posiciones VÁLIDAS
+            valid_position_count = len(positions)
+            
+            print(f"✅ {valid_position_count} posición(es) REALMENTE abierta(s)")
+            
+            if orders:
+                print(f"📋 {len(orders)} orden(es) pendiente(s) (no se cuentan como posiciones)")
+            
             if positions:
-                print(f"✓ {len(positions)} posición(es) abierta(s)")
-                
                 for pos_id, pos_data in positions.items():
                     pair = pos_data.get('pair', 'UNKNOWN')
                     pos_margin = float(pos_data.get('margin', 0))
@@ -759,6 +792,7 @@ class TradingBotV3:
                             pair, pos_type, volume, reason, pos_data, current_price
                         )
                         total_margin_used -= pos_margin
+                        valid_position_count -= 1
                     else:
                         print(f"   ✓ Mantener posición")
             else:
@@ -766,16 +800,18 @@ class TradingBotV3:
             
             print(f"\n💰 Margen usado: {total_margin_used:.2f} {currency}")
             print(f"   Margen restante: {(available_margin - total_margin_used):.2f} {currency}")
+            print(f"   Posiciones activas: {valid_position_count}/{self.config.MAX_POSITIONS}")
             
-            if len(open_symbols) >= self.config.MAX_POSITIONS:
-                print(f"\nℹ️  Máximo de posiciones alcanzado ({self.config.MAX_POSITIONS})")
+            # ✅ CRUCIAL: Usar valid_position_count en lugar de len(positions)
+            if valid_position_count >= self.config.MAX_POSITIONS:
+                print(f"\nℹ️ Máximo de posiciones alcanzado ({self.config.MAX_POSITIONS})")
                 return
             
             margin_for_new = (available_margin - total_margin_used) / self.config.MARGIN_SAFETY_FACTOR
             print(f"   Margen para nuevas posiciones: {margin_for_new:.2f} {currency}")
             
             if margin_for_new < self.config.MIN_BALANCE * 0.5:
-                print(f"⚠️  Margen insuficiente para nuevas posiciones")
+                print(f"⚠️ Margen insuficiente para nuevas posiciones")
                 return
             
             print("\n🔍 Buscando señales en activos disponibles...")
@@ -786,7 +822,7 @@ class TradingBotV3:
                     continue
                 
                 if pair.yf_symbol in open_symbols:
-                    print(f"   ⏭️  {pair.yf_symbol}: posición ya abierta")
+                    print(f"   ⭐ {pair.yf_symbol}: posición ya abierta")
                     continue
                 
                 data = market_data[pair.yf_symbol]
@@ -811,12 +847,12 @@ class TradingBotV3:
                     )
                     
                     if required_margin > allocation_margin:
-                        print(f"   ⚠️  {pair.yf_symbol}: margen insuficiente "
+                        print(f"   ⚠️ {pair.yf_symbol}: margen insuficiente "
                               f"(necesita {required_margin:.2f}, disponible {allocation_margin:.2f})")
                         continue
                     
                     if tentative_volume < pair.min_volume:
-                        print(f"   ⚠️  {pair.yf_symbol}: volumen {tentative_volume:.6f} < mínimo {pair.min_volume}")
+                        print(f"   ⚠️ {pair.yf_symbol}: volumen {tentative_volume:.6f} < mínimo {pair.min_volume}")
                         continue
                     
                     can_open, max_corr = CorrelationManager.check_position_correlation(
@@ -837,20 +873,23 @@ class TradingBotV3:
                         print(f"   ✓ {pair.yf_symbol}: {signal} (conf: {confidence:.2f}, "
                               f"régimen: {regime}, corr: {max_corr:.2f}, margen: {required_margin:.2f})")
                     else:
-                        print(f"   ⚠️  {pair.yf_symbol}: {signal} rechazado por correlación ({max_corr:.2f})")
+                        print(f"   ⚠️ {pair.yf_symbol}: {signal} rechazado por correlación ({max_corr:.2f})")
                 else:
                     print(f"   - {pair.yf_symbol}: sin señal")
             
             if not signals:
-                print("\nℹ️  No hay señales válidas")
+                print("\nℹ️ No hay señales válidas")
                 return
             
             signals.sort(key=lambda x: x['confidence'], reverse=True)
             
+            # ✅ USAR valid_position_count
             positions_to_open = min(
                 len(signals), 
-                self.config.MAX_POSITIONS - len(open_symbols)
+                self.config.MAX_POSITIONS - valid_position_count
             )
+            
+            print(f"\n🎯 Abriendo {positions_to_open} posición(es)...")
             
             for sig in signals[:positions_to_open]:
                 self.open_position(sig, margin_for_new)
