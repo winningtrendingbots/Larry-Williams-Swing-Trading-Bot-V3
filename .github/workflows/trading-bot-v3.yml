@@ -1,9 +1,12 @@
 name: Kraken Trading Bot V3
 
 on:
-  # Ejecutar cada hora
+  # ✅ CADA 15 MINUTOS (monitoreo frecuente)
   schedule:
-    - cron: '0 * * * *'
+    - cron: '*/15 * * * *'  # Cada 15 minutos
+    # Alternativas:
+    # - cron: '*/30 * * * *'  # Cada 30 minutos
+    # - cron: '*/5 * * * *'   # Cada 5 minutos (muy frecuente)
   
   # Manual
   workflow_dispatch:
@@ -32,38 +35,37 @@ jobs:
     
     - name: 🚀 Ejecutar bot V3 (Multi-Asset + ML + Adaptive)
       env:
-        # Kraken (configurar en Settings > Secrets)
+        # Kraken
         KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
         KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
         
-        # Telegram (configurar en Settings > Secrets)
+        # Telegram
         TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         
-        # Multi-Asset (editar según preferencias)
-        # Trading pairs se definen en el código
-        MAX_CORRELATION: '0.7'     # Máxima correlación permitida
-        MAX_POSITIONS: '3'         # Máximo posiciones simultáneas
+        # Multi-Asset
+        MAX_CORRELATION: '0.7'
+        MAX_POSITIONS: '3'
         
-        # Trading Base
-        LEVERAGE: '3'              # 3x leverage
-        MIN_BALANCE: '30.0'        # Balance mínimo (aumentado para multi-asset)
+        # Trading
+        LEVERAGE: '3'
+        MIN_BALANCE: '30.0'
         
-        # Risk Management (base - se adaptan según régimen)
+        # Risk Management
         STOP_LOSS_PCT: '4.0'
         TAKE_PROFIT_PCT: '8.0'
         TRAILING_STOP_PCT: '2.5'
         MIN_PROFIT_FOR_TRAILING: '3.0'
         
-        # Strategy
-        LOOKBACK_PERIOD: '180d'    # 6 meses de historia para mejor análisis
-        CANDLE_INTERVAL: '1h'      # Velas de 1 hora
+        # Strategy - ⭐ VELAS DE 1H (sin cambios)
+        LOOKBACK_PERIOD: '180d'
+        CANDLE_INTERVAL: '1h'  # ✅ Mantener 1h
         USE_VOLUME_FILTER: 'true'
-        REGIME_LOOKBACK: '30'      # Ventana para detectar régimen
+        REGIME_LOOKBACK: '30'
         
         # Machine Learning
-        USE_ML_VALIDATION: 'true'          # Validación ML de swing points
-        ML_CONFIDENCE_THRESHOLD: '0.6'    # Confianza mínima (0.0-1.0)
+        USE_ML_VALIDATION: 'true'
+        ML_CONFIDENCE_THRESHOLD: '0.6'
         
         # Mode
         DRY_RUN: ${{ github.event.inputs.dry_run || 'true' }}
@@ -72,8 +74,8 @@ jobs:
     
     - name: ✅ Completado
       if: success()
-      run: echo "Bot V3 ejecutado correctamente"
+      run: echo "Bot V3 ejecutado - $(date)"
     
     - name: ❌ Error
       if: failure()
-      run: echo "Error en la ejecución"
+      run: echo "Error en la ejecución - $(date)"
